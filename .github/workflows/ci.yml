@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/**']  # TEMP: measure on the fork, revert before PR
   pull_request:
     branches: [main]
 
@@ -222,6 +222,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # TEMP: see every Python version's failures while measuring
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
 
@@ -252,60 +253,14 @@ jobs:
       - name: Test ClawBio CLI
         run: uv run python clawbio.py list
 
-      - name: Run PharmGx Reporter tests
-        run: uv run pytest skills/pharmgx-reporter/tests/test_pharmgx.py -v
-
-      - name: Run Equity Scorer tests
-        run: uv run pytest skills/equity-scorer/tests/test_equity_scorer.py -v
-
-      - name: Run NutriGx tests
-        run: uv run pytest skills/nutrigx/tests/test_nutrigx.py -v
-
-      - name: Run Genome Comparator tests
-        run: uv run pytest skills/genome-compare/tests/test_genome_compare.py -v
-
-      - name: Run ClinPGx tests
-        run: uv run pytest skills/clinpgx/tests/test_clinpgx.py -v
-
-      - name: Run GWAS PRS tests
-        run: uv run pytest skills/gwas-prs/tests/ -v
-
-      - name: Run WGS PRS tests
-        run: uv run pytest skills/wgs-prs/tests/ -v
-
-      - name: Run GWAS Lookup tests
-        run: uv run pytest skills/gwas-lookup/tests/test_gwas_lookup.py -v
-
-      - name: Run RNA-seq DE tests
-        run: uv run pytest skills/rnaseq-de/tests/test_rnaseq_de.py -v
-
-      - name: Run nf-core Sarek Wrapper tests
-        run: uv run pytest skills/nfcore-sarek-wrapper/tests/ -v
-
-      - name: Run Skill Builder tests
-        run: uv run pytest skills/skill-builder/tests/test_skill_builder.py -v
-
-      - name: Run VCF Annotator tests
-        run: uv run pytest skills/vcf-annotator/tests/test_vcf_annotator.py -v
-
-      - name: Run bot security tests
-        run: uv run pytest bot/tests/test_security.py -v
-
-      # Repo-level tests were never run by this job. The steps above name skill
-      # test files individually, so `tests/` was invisible to CI: both
-      # test_generate_catalog.py and the bench-baseline gate's own tests could
-      # have gone red on main without anything reporting it. A gate whose tests
-      # do not run is the #342 problem one level up. (See also #337.)
-      - name: Run repo-level tests
-        run: uv run pytest tests/ -v
-
-      # Named two files out of clawbio/tests/, and clawbio/common/tests/ ran
-      # nowhere at all, so the shared layer every skill imports was the least
-      # tested code in the repository. test_report.py had been red on main
-      # unnoticed, and ClawBio#451's helper tests would not have run after
-      # merge either. Both trees now run in full: 524 tests, about 20 seconds.
-      - name: Run library tests
-        run: uv run pytest clawbio/tests/ clawbio/common/tests/ -v
+      - name: Run the whole test suite
+        # Every skill's tests, not a hand-picked list: pytest.ini already
+        # collects skills/*/tests, tests/, clawbio/ and bot/tests. Markers for
+        # tests that need the network, external tools or minutes are excluded.
+        run: >-
+          uv run pytest -p no:cacheprovider -rfE
+          --continue-on-collection-errors
+          -m "not network and not slow and not integration and not mcp"
 
       # The steps above are a hardcoded allowlist, so a NEW skill's tests never
       # run: ClawBio#329 shipped a test that cannot pass and CI was still green,
