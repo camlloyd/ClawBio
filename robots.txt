@@ -1,0 +1,8 @@
+# robots.txt for https://clawbio.ai (RFC 9309)
+# The site is the repo root served by GitHub Pages; keep pages, docs and
+# llms.txt crawlable, skip test fixtures and raw benchmark run output.
+
+User-agent: *
+Allow: /
+Disallow: /tests/
+Disallow: /bench_runs/
