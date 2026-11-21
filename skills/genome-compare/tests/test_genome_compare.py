@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from hypothesis import given, strategies as st
 from inline_snapshot import snapshot
 
 from clawbio.common import demo_runner
@@ -151,6 +152,27 @@ def test_ibs_haploid_match():
 def test_ibs_haploid_mismatch():
     """Haploid A vs T → IBS = 0."""
     assert _ibs_at_site("A", "T") == 0
+
+
+@pytest.mark.parametrize(
+    ("hemi", "diploid", "expected"),
+    [("A", "AA", 2), ("A", "AG", 1), ("A", "GA", 1), ("A", "GG", 0)],
+)
+def test_ibs_hemizygous_vs_diploid_reads_hemizygous_as_homozygous(hemi, diploid, expected):
+    """A male X call against a female call shares alleles like a homozygote."""
+    assert _ibs_at_site(hemi, diploid) == expected
+    assert _ibs_at_site(diploid, hemi) == expected
+
+
+_CALL = st.text(alphabet="ACGT", min_size=1, max_size=2)
+
+
+@given(a=_CALL, b=_CALL)
+def test_property_ibs_is_symmetric_bounded_and_two_for_identical(a, b):
+    ibs = _ibs_at_site(a, b)
+    assert 0 <= ibs <= 2
+    assert ibs == _ibs_at_site(b, a)
+    assert _ibs_at_site(a, a) == 2
 
 
 def test_compute_ibs_score_range(demo_patient, reference_genome):

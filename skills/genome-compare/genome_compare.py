@@ -99,12 +99,17 @@ def _parse_genotype_file(filepath: str | Path) -> Tuple[dict, dict]:
 def _ibs_at_site(geno_a: str, geno_b: str) -> int:
     """Compute IBS (0, 1, or 2) between two diploid genotype calls.
 
-    Handles haploid calls on X/Y/MT (single character).
+    Handles haploid calls on X/Y/MT (single character) by reading them as
+    homozygous, as PLINK does: male ``A`` vs female ``AA`` is IBS 2 and vs
+    ``AG`` is IBS 1. Scoring every mixed-ploidy site as 0 would pull down the
+    genome-wide IBS of any male-female pair.
     """
-    if len(geno_a) == 1 and len(geno_b) == 1:
-        return 2 if geno_a == geno_b else 0
-    if len(geno_a) < 2 or len(geno_b) < 2:
+    if not geno_a or not geno_b:
         return 0
+    if len(geno_a) == 1:
+        geno_a = geno_a * 2
+    if len(geno_b) == 1:
+        geno_b = geno_b * 2
 
     a_alleles = list(geno_a[:2])
     b_alleles = list(geno_b[:2])
