@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from hypothesis import example, given, strategies as st
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SKILL_DIR.parents[1]
@@ -52,6 +53,64 @@ def test_validate_read_only_sql_accepts_select_and_with():
 def test_validate_read_only_sql_rejects_unsafe_queries(query: str, expected: str):
     with pytest.raises(skill.QueryValidationError, match=expected):
         skill.validate_read_only_sql(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT '--' AS a; DROP TABLE t",
+        'SELECT "--" AS a; INSERT INTO t VALUES (1)',
+        "SELECT '/*' AS a; DELETE FROM t WHERE TRUE; SELECT '*/'",
+        "SELECT '#' AS a; DROP TABLE t",
+        r"SELECT 'it\'s -- ' AS a; DROP TABLE t",
+        'SELECT """x -- """ AS a; DROP TABLE t',
+        "SELECT `a--b` FROM t; DROP TABLE t",
+    ],
+)
+def test_validate_read_only_sql_rejects_statement_hidden_behind_a_literal(query: str):
+    # A comment marker inside a literal must not hide the statement after it.
+    with pytest.raises(skill.QueryValidationError):
+        skill.validate_read_only_sql(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT '-- not a comment' AS a",
+        r"SELECT r'C:\path\' AS p",
+        "SELECT 'a' AS x -- trailing comment with ' quote\nFROM t",
+        "SELECT 1 /* block ' \" ` */ AS x",
+        "SELECT '''multi\nline -- ;''' AS x",
+        "SELECT `my-project.ds.drop` FROM t",
+    ],
+)
+def test_validate_read_only_sql_accepts_literals_and_comments(query: str):
+    assert skill.validate_read_only_sql(query) == query
+
+
+@pytest.mark.parametrize("query", ["SELECT 'unterminated", "SELECT 1 /* open"])
+def test_validate_read_only_sql_rejects_unterminated_tokens(query: str):
+    with pytest.raises(skill.QueryValidationError, match="Unterminated"):
+        skill.validate_read_only_sql(query)
+
+
+def _bq_string_literal(content: str, quote: str) -> str:
+    escaped = content.replace("\\", "\\\\").replace(quote, "\\" + quote)
+    return f"{quote}{escaped}{quote}"
+
+
+@given(
+    content=st.text(alphabet="ab -/*#;'\"`\\\n", max_size=12),
+    quote=st.sampled_from(["'", '"']),
+)
+@example(content="--", quote="'")
+@example(content="/*", quote='"')
+def test_property_no_literal_hides_a_second_statement(content: str, quote: str):
+    literal = _bq_string_literal(content, quote)
+    single = f"SELECT {literal} AS a"
+    assert skill.validate_read_only_sql(single) == single
+    with pytest.raises(skill.QueryValidationError):
+        skill.validate_read_only_sql(f"{single}; DROP TABLE t")
 
 
 def test_parse_scalar_param_valid_types():

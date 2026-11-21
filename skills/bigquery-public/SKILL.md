@@ -116,7 +116,7 @@ Expected output: a local report and CSV preview using a bundled snapshot of `big
 
 ## Algorithm / Methodology
 
-1. **Normalize query**: strip comments, mask literals, reject non-read-only SQL.
+1. **Normalize query**: blank comments and literals in one left-to-right pass (so a `--` or `/*` inside a string cannot hide a second statement), reject unterminated literals, then reject non-read-only SQL.
 2. **Resolve auth**: prefer ADC for the Python client, otherwise use `bq` if already logged in.
 3. **Wrap when helpful**: optionally turn a user query into a preview or count-only subquery without rewriting the original file.
 4. **Run safely**: apply `--max-bytes-billed`, `--max-rows`, and optional dry-run.

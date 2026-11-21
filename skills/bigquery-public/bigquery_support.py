@@ -79,25 +79,61 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _mask_sql_literals(text: str) -> str:
-    patterns = [
-        r"'(?:''|[^'])*'",
-        r'"(?:\\"|[^"])*"',
-        r"`(?:``|[^`])*`",
-    ]
-    masked = text
-    for pattern in patterns:
-        masked = re.sub(pattern, lambda m: " " * len(m.group(0)), masked, flags=re.DOTALL)
-    return masked
+def _sql_code_view(text: str) -> str:
+    """Return ``text`` with every string literal, quoted identifier and comment
+    blanked to spaces (newlines kept), so only executable SQL remains.
 
+    Literals and comments are recognised in one left-to-right pass, as the
+    BigQuery lexer reads them. Two separate passes (comments first, then
+    literals, or the reverse) let a ``--`` or ``/*`` inside a string hide the
+    statement after it, or a quote inside a comment hide the code after it.
+    Unterminated literals and block comments are rejected rather than guessed.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
 
-def _strip_sql_comments(text: str) -> str:
-    no_block = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    return re.sub(r"--.*?$", " ", no_block, flags=re.MULTILINE)
+    def blank(chunk: str) -> str:
+        return "".join("\n" if ch == "\n" else " " for ch in chunk)
+
+    while i < n:
+        ch = text[i]
+        if text.startswith("--", i) or ch == "#":
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            out.append(blank(text[i:end]))
+            i = end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end < 0:
+                raise QueryValidationError("Unterminated /* comment.")
+            out.append(blank(text[i:end + 2]))
+            i = end + 2
+        elif ch in "'\"`":
+            # A raw prefix (r, rb, br in any case) turns off backslash escapes.
+            prefix = re.search(r"(?<![A-Za-z0-9_])[rRbB]{1,2}$", text[:i])
+            raw = bool(prefix) and "r" in prefix.group(0).lower()
+            quote = text[i:i + 3] if ch != "`" and text.startswith(ch * 3, i) else ch
+            k = i + len(quote)
+            while True:
+                if k >= n:
+                    raise QueryValidationError("Unterminated quoted string or identifier.")
+                if text[k] == "\\" and not raw and ch != "`":
+                    k += 2
+                    continue
+                if text.startswith(quote, k):
+                    k += len(quote)
+                    break
+                k += 1
+            out.append(blank(text[i:k]))
+            i = k
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def _analysis_sql(query: str) -> str:
-    return re.sub(r"\s+", " ", _mask_sql_literals(_strip_sql_comments(query))).strip().upper()
+    return re.sub(r"\s+", " ", _sql_code_view(query)).strip().upper()
 
 
 def validate_read_only_sql(query: str) -> str:
@@ -105,7 +141,7 @@ def validate_read_only_sql(query: str) -> str:
     if not cleaned:
         raise QueryValidationError("Query is empty.")
 
-    masked = _mask_sql_literals(_strip_sql_comments(cleaned))
+    masked = _sql_code_view(cleaned)
     masked_stripped = masked.strip()
     leading = masked_stripped.upper()
     if not (leading.startswith("SELECT") or leading.startswith("WITH")):
