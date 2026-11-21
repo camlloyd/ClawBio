@@ -727,3 +727,60 @@ CNV_LB_caseev,chr2,50120000,50180000,loss,1,-0.95,Likely benign,1A;3A;4;5B
 CNV_P_dup22q,chr22,18800000,21600000,gain,3,1.45,Pathogenic,1A;2A;5A
 CNV_LP_genedense,chr19,51990000,52410000,loss,40,0.9,Likely pathogenic,1A;3C
 """})
+
+
+# --------------------------------------------------------------------------- #
+# Non-finite case evidence, 1B as the terminal call, and properties
+# --------------------------------------------------------------------------- #
+from hypothesis import given, strategies as st  # noqa: E402
+
+
+@pytest.mark.parametrize("bad", ["nan", "NaN", "inf", "-inf"])
+def test_non_finite_case_evidence_is_rejected_on_load(tmp_path, bad):
+    m = load_module()
+    calls = tmp_path / "calls.csv"
+    calls.write_text(
+        "cnv_id,chrom,start,end,type,inheritance,case_evidence_points\n"
+        f"c1,chr2,50120000,50180000,DEL,unknown,{bad}\n"
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        m.load_cnvs(calls)
+
+
+def test_nan_case_evidence_is_not_clamped_to_pathogenic_evidence():
+    # min(0.90, nan) is 0.90: before the fix this VUS scored +0.90 (Likely pathogenic).
+    m = load_module()
+    with pytest.raises(ValueError, match="non-finite"):
+        m.score_cnv(cnv(chrom="2", start=50120000, end=50180000,
+                        case_evidence_points=float("nan")), DOSAGE_MAP, GENE_MODEL)
+
+
+def test_1B_is_terminal_per_riggs_table_1():
+    # Only 1A says "(Continue Evaluation)": inheritance and case evidence do not
+    # move a CNV with no functional content.
+    m = load_module()
+    for inh, case in [("de_novo", 0.9), ("inherited", -0.9)]:
+        res = m.score_cnv(cnv(chrom="5", start=1000, end=2000, inheritance=inh,
+                              case_evidence_points=case), DOSAGE_MAP, GENE_MODEL)
+        assert codes_of(res) == {"1B"}
+        assert res["total_score"] == -0.60
+
+
+_TIERS = ["Benign", "Likely benign", "Variant of uncertain significance",
+          "Likely pathogenic", "Pathogenic"]
+
+
+@given(a=st.floats(-5, 5), b=st.floats(-5, 5))
+def test_property_classification_never_drops_as_score_rises(a, b):
+    m = load_module()
+    lo, hi = sorted((round(a, 2), round(b, 2)))
+    assert _TIERS.index(m.classify_score(lo)) <= _TIERS.index(m.classify_score(hi))
+
+
+@given(case=st.floats(-2, 2), inh=st.sampled_from(["unknown", "de_novo", "inherited"]))
+def test_property_more_case_evidence_never_lowers_the_score(case, inh):
+    m = load_module()
+    region = dict(chrom="2", start=50120000, end=50180000, inheritance=inh)
+    low = m.score_cnv(cnv(**region, case_evidence_points=case), DOSAGE_MAP, GENE_MODEL)
+    high = m.score_cnv(cnv(**region, case_evidence_points=case + 0.1), DOSAGE_MAP, GENE_MODEL)
+    assert low["total_score"] <= high["total_score"]

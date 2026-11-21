@@ -20,6 +20,7 @@ import argparse
 import csv
 import gzip
 import json
+import math
 import shlex
 import sys
 from pathlib import Path
@@ -151,6 +152,11 @@ def _parse_table(path: Path) -> list[dict]:
                 }
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Malformed CNV row {raw.get('cnv_id', '?')}: {exc}") from exc
+            if not math.isfinite(row["case_evidence_points"]):
+                raise ValueError(
+                    f"CNV {row['cnv_id']} has non-finite case_evidence_points "
+                    f"{raw.get('case_evidence_points')!r}; leave it blank for no evidence"
+                )
             if row["end"] < row["start"]:
                 raise ValueError(f"CNV {row['cnv_id']} has end < start")
             rows.append(row)
@@ -295,6 +301,8 @@ def score_cnv(cnv: dict, dosage_map: list[dict], gene_model: list[dict]) -> dict
     # --- Section 1: genomic content ---
     has_content = bool(genes) or bool(dosage_hits)
     if not has_content:
+        # Riggs 2020 Table 1/2: only 1A carries "(Continue Evaluation)", so 1B is
+        # the one terminal call; Sections 2-5 are not scored after it.
         add("1B", -0.60, "CNV contains no protein-coding genes or known functional elements")
         total = -0.60
         return _result(cnv, cnv_type, genes, evidence, total)
@@ -303,7 +311,7 @@ def score_cnv(cnv: dict, dosage_map: list[dict], gene_model: list[dict]) -> dict
     # --- Section 2: overlap with established dosage-sensitive / benign regions ---
     # Per Riggs 2020 the sections are ADDITIVE: Section 2 contributes one option's
     # points and the run continues. There is no early return for 2A or 2F — Sections
-    # 4 (case) and 5 (inheritance) are always summed, so e.g. a complete 2A deletion
+    # 4 (case) and 5 (inheritance) are always summed after 1A, so e.g. a complete 2A deletion
     # inherited from an unaffected parent is 1.00 + (-0.30) = 0.70 = VUS, exactly the
     # ClinGen worked example.
     relevant_key = "hi_score" if cnv_type == "loss" else "ts_score"
@@ -337,13 +345,17 @@ def score_cnv(cnv: dict, dosage_map: list[dict], gene_model: list[dict]) -> dict
         code3, pts3 = _gene_count_points(cnv_type, len(genes))
         add(code3, pts3, f"{len(genes)} protein-coding gene(s) wholly or partially included")
 
-    # --- Section 4: curator case/literature evidence (clamped, always summed) ---
+    # --- Section 4: curator case/literature evidence (clamped, summed after 1A) ---
     case_pts = float(cnv.get("case_evidence_points") or 0.0)
+    if not math.isfinite(case_pts):
+        # min/max cannot clamp NaN: min(0.90, nan) is 0.90, so a NaN would score
+        # as maximal pathogenic evidence.
+        raise ValueError(f"CNV {cnv['cnv_id']} has non-finite case_evidence_points")
     if case_pts:
         clamped = max(-CASE_EVIDENCE_CAP, min(CASE_EVIDENCE_CAP, case_pts))
         add("4", clamped, "Analyst-supplied case-level / literature evidence")
 
-    # --- Section 5: inheritance (always summed) ---
+    # --- Section 5: inheritance (summed after 1A) ---
     inh = str(cnv.get("inheritance", "unknown")).strip().lower()
     if inh in {"de_novo", "denovo", "de novo"}:
         add("5A", DE_NOVO_POINTS, "Observed de novo (both parents tested)")
