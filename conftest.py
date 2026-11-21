@@ -4,6 +4,20 @@ import os
 from pathlib import Path
 
 import pytest
+from hypothesis import settings
+
+# Opt-in symbolic search for property tests (see AGENTS.md):
+#   uv run --with hypothesis-crosshair pytest skills/<skill>/tests \
+#       -k property --hypothesis-profile=crosshair
+# CrossHair drives Hypothesis's inputs with the Z3 solver, so it reaches
+# boundary and NaN cases random generation can miss. It is slower and
+# time-bounded: a pass is not a proof, so CI keeps the default profile.
+try:
+    import hypothesis_crosshair_provider  # noqa: F401
+except ImportError:
+    pass
+else:
+    settings.register_profile("crosshair", backend="crosshair", deadline=None, max_examples=200)
 
 
 # pytest.ini collects skills/*/tests by glob. clinical-variant-prioritizer's

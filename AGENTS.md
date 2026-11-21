@@ -255,6 +255,8 @@ with examples:
 | A conversion round-trips | VCF to VEP region conversion that assumes a one-base anchor sends `AT>ATT` as an insertion of `TT` |
 | More evidence in one direction never moves the result the other way | ACMG combining rules |
 | Output does not depend on input order | anything built from a directory listing or `git ls-files` |
+| NaN never lands in the most extreme category | a threshold loop whose `<=` tests are all False for NaN falls through to "High" (gwas-prs) |
+| A guard checks the same text that runs | stripping comments before masking strings let `SELECT '--'; DROP TABLE t` past the read-only check (bigquery-public) |
 
 In the red/green cycle, the property is the step 1 test. For new code, write the
 property before the implementation. For a bug, let Hypothesis find the minimal
@@ -266,6 +268,19 @@ Keep strategies small and domain-shaped (`st.sampled_from("ACGT")`). Bounded
 `| st.just(float("nan"))` when the code must handle them. Use
 `@settings(deadline=None)` for properties that run a skill end to end;
 Hypothesis's default 200 ms deadline otherwise makes them flaky in CI.
+
+For thresholds, scoring rules and input guards, also run the properties with
+[CrossHair](https://github.com/pschanely/CrossHair), which picks inputs with
+the Z3 solver instead of at random and so reaches exact boundaries and NaN:
+
+```bash
+uv run --with hypothesis-crosshair pytest skills/<skill>/tests -k property --hypothesis-profile=crosshair
+```
+
+It is not a dependency and not run in CI: it is slower, and it stops at a time
+limit, so a pass is not a proof. Pin anything it finds with `@example(...)` so
+the default run keeps it. It works best on plain-Python logic; it cannot see
+inside numpy or pandas, and it rarely gets through regex-heavy string code.
 
 ## How to Add a New Skill
 
