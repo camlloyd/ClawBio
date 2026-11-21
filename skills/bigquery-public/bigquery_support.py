@@ -79,56 +79,62 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _sql_code_view(text: str) -> str:
-    """Return ``text`` with every string literal, quoted identifier and comment
-    blanked to spaces (newlines kept), so only executable SQL remains.
+# Token patterns transcribed from the GoogleSQL (BigQuery) lexer grammar,
+# googlesql/parser/googlesql.tm in github.com/google/zetasql. Two rules matter
+# for a guard and are easy to get wrong:
+#   * a backslash always consumes the next character, in raw strings, bytes and
+#     backtick identifiers too ("escaped quotes don't count"), so r'\'' does
+#     not end at the second quote;
+#   * single-quoted tokens cannot span \r or \n, and -- / # comments end at
+#     either \r or \n.
+_SQL_ESCAPE = r"\\(?:\r\n|[\s\S])"
+_SQL_QUOTED = {
+    "'''": re.compile(r"'''(?:(?:'|'')?(?:[^'\\]|" + _SQL_ESCAPE + r"))*'''"),
+    '"""': re.compile(r'"""(?:(?:"|"")?(?:[^"\\]|' + _SQL_ESCAPE + r'))*"""'),
+    "'": re.compile(r"'(?:[^'\\\n\r]|" + _SQL_ESCAPE + r")*'"),
+    '"': re.compile(r'"(?:[^"\\\n\r]|' + _SQL_ESCAPE + r')*"'),
+    "`": re.compile(r"`(?:[^\\`\r\n]|" + _SQL_ESCAPE + r")*`"),
+}
+_SQL_LINE_COMMENT = re.compile(r"(?:--|#)[^\r\n]*")
+_SQL_BLOCK_COMMENT = re.compile(r"/\*[\s\S]*?\*/")
 
-    Literals and comments are recognised in one left-to-right pass, as the
-    BigQuery lexer reads them. Two separate passes (comments first, then
-    literals, or the reverse) let a ``--`` or ``/*`` inside a string hide the
-    statement after it, or a quote inside a comment hide the code after it.
-    Unterminated literals and block comments are rejected rather than guessed.
+
+def _sql_code_view(text: str) -> str:
+    """Return ``text`` with every string/bytes literal, quoted identifier and
+    comment blanked to spaces (line breaks kept), so only executable SQL remains.
+
+    Tokens are recognised in one left-to-right pass with the BigQuery lexer's
+    own patterns (see ``_SQL_QUOTED``). Two separate regex passes (comments
+    first, then literals) let a ``--`` inside a string hide the statement after
+    it. Unterminated literals, identifiers and block comments are rejected, as
+    BigQuery rejects them.
     """
     out: list[str] = []
     i, n = 0, len(text)
 
     def blank(chunk: str) -> str:
-        return "".join("\n" if ch == "\n" else " " for ch in chunk)
+        return "".join(ch if ch in "\r\n" else " " for ch in chunk)
 
     while i < n:
         ch = text[i]
         if text.startswith("--", i) or ch == "#":
-            end = text.find("\n", i)
-            end = n if end < 0 else end
-            out.append(blank(text[i:end]))
-            i = end
+            m = _SQL_LINE_COMMENT.match(text, i)
         elif text.startswith("/*", i):
-            end = text.find("*/", i + 2)
-            if end < 0:
+            m = _SQL_BLOCK_COMMENT.match(text, i)
+            if m is None:
                 raise QueryValidationError("Unterminated /* comment.")
-            out.append(blank(text[i:end + 2]))
-            i = end + 2
         elif ch in "'\"`":
-            # A raw prefix (r, rb, br in any case) turns off backslash escapes.
-            prefix = re.search(r"(?<![A-Za-z0-9_])[rRbB]{1,2}$", text[:i])
-            raw = bool(prefix) and "r" in prefix.group(0).lower()
-            quote = text[i:i + 3] if ch != "`" and text.startswith(ch * 3, i) else ch
-            k = i + len(quote)
-            while True:
-                if k >= n:
-                    raise QueryValidationError("Unterminated quoted string or identifier.")
-                if text[k] == "\\" and not raw and ch != "`":
-                    k += 2
-                    continue
-                if text.startswith(quote, k):
-                    k += len(quote)
-                    break
-                k += 1
-            out.append(blank(text[i:k]))
-            i = k
+            opener = text[i:i + 3] if ch != "`" and text.startswith(ch * 3, i) else ch
+            m = _SQL_QUOTED[opener].match(text, i)
+            if m is None:
+                raise QueryValidationError("Unterminated quoted string or identifier.")
         else:
-            out.append(ch)
+            # BigQuery also treats backspace as whitespace; Python's \s does not.
+            out.append(" " if ch == "\x08" else ch)
             i += 1
+            continue
+        out.append(blank(m.group(0)))
+        i = m.end()
     return "".join(out)
 
 
