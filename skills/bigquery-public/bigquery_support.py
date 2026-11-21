@@ -79,25 +79,67 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _mask_sql_literals(text: str) -> str:
-    patterns = [
-        r"'(?:''|[^'])*'",
-        r'"(?:\\"|[^"])*"',
-        r"`(?:``|[^`])*`",
-    ]
-    masked = text
-    for pattern in patterns:
-        masked = re.sub(pattern, lambda m: " " * len(m.group(0)), masked, flags=re.DOTALL)
-    return masked
+# Token patterns transcribed from the GoogleSQL (BigQuery) lexer grammar,
+# googlesql/parser/googlesql.tm in github.com/google/zetasql. Two rules matter
+# for a guard and are easy to get wrong:
+#   * a backslash always consumes the next character, in raw strings, bytes and
+#     backtick identifiers too ("escaped quotes don't count"), so r'\'' does
+#     not end at the second quote;
+#   * single-quoted tokens cannot span \r or \n, and -- / # comments end at
+#     either \r or \n.
+_SQL_ESCAPE = r"\\(?:\r\n|[\s\S])"
+_SQL_QUOTED = {
+    "'''": re.compile(r"'''(?:(?:'|'')?(?:[^'\\]|" + _SQL_ESCAPE + r"))*'''"),
+    '"""': re.compile(r'"""(?:(?:"|"")?(?:[^"\\]|' + _SQL_ESCAPE + r'))*"""'),
+    "'": re.compile(r"'(?:[^'\\\n\r]|" + _SQL_ESCAPE + r")*'"),
+    '"': re.compile(r'"(?:[^"\\\n\r]|' + _SQL_ESCAPE + r')*"'),
+    "`": re.compile(r"`(?:[^\\`\r\n]|" + _SQL_ESCAPE + r")*`"),
+}
+_SQL_LINE_COMMENT = re.compile(r"(?:--|#)[^\r\n]*")
+_SQL_BLOCK_COMMENT = re.compile(r"/\*[\s\S]*?\*/")
 
 
-def _strip_sql_comments(text: str) -> str:
-    no_block = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    return re.sub(r"--.*?$", " ", no_block, flags=re.MULTILINE)
+def _sql_code_view(text: str) -> str:
+    """Return ``text`` with every string/bytes literal, quoted identifier and
+    comment blanked to spaces (line breaks kept), so only executable SQL remains.
+
+    Tokens are recognised in one left-to-right pass with the BigQuery lexer's
+    own patterns (see ``_SQL_QUOTED``). Two separate regex passes (comments
+    first, then literals) let a ``--`` inside a string hide the statement after
+    it. Unterminated literals, identifiers and block comments are rejected, as
+    BigQuery rejects them.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+
+    def blank(chunk: str) -> str:
+        return "".join(ch if ch in "\r\n" else " " for ch in chunk)
+
+    while i < n:
+        ch = text[i]
+        if text.startswith("--", i) or ch == "#":
+            m = _SQL_LINE_COMMENT.match(text, i)
+        elif text.startswith("/*", i):
+            m = _SQL_BLOCK_COMMENT.match(text, i)
+            if m is None:
+                raise QueryValidationError("Unterminated /* comment.")
+        elif ch in "'\"`":
+            opener = text[i:i + 3] if ch != "`" and text.startswith(ch * 3, i) else ch
+            m = _SQL_QUOTED[opener].match(text, i)
+            if m is None:
+                raise QueryValidationError("Unterminated quoted string or identifier.")
+        else:
+            # BigQuery also treats backspace as whitespace; Python's \s does not.
+            out.append(" " if ch == "\x08" else ch)
+            i += 1
+            continue
+        out.append(blank(m.group(0)))
+        i = m.end()
+    return "".join(out)
 
 
 def _analysis_sql(query: str) -> str:
-    return re.sub(r"\s+", " ", _mask_sql_literals(_strip_sql_comments(query))).strip().upper()
+    return re.sub(r"\s+", " ", _sql_code_view(query)).strip().upper()
 
 
 def validate_read_only_sql(query: str) -> str:
@@ -105,7 +147,7 @@ def validate_read_only_sql(query: str) -> str:
     if not cleaned:
         raise QueryValidationError("Query is empty.")
 
-    masked = _mask_sql_literals(_strip_sql_comments(cleaned))
+    masked = _sql_code_view(cleaned)
     masked_stripped = masked.strip()
     leading = masked_stripped.upper()
     if not (leading.startswith("SELECT") or leading.startswith("WITH")):

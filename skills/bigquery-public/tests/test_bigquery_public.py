@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from hypothesis import example, given, strategies as st
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SKILL_DIR.parents[1]
@@ -52,6 +53,72 @@ def test_validate_read_only_sql_accepts_select_and_with():
 def test_validate_read_only_sql_rejects_unsafe_queries(query: str, expected: str):
     with pytest.raises(skill.QueryValidationError, match=expected):
         skill.validate_read_only_sql(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT '--' AS a; DROP TABLE t",
+        'SELECT "--" AS a; INSERT INTO t VALUES (1)',
+        "SELECT '/*' AS a; DELETE FROM t WHERE TRUE; SELECT '*/'",
+        "SELECT '#' AS a; DROP TABLE t",
+        r"SELECT 'it\'s -- ' AS a; DROP TABLE t",
+        'SELECT """x -- """ AS a; DROP TABLE t',
+        "SELECT `a--b` FROM t; DROP TABLE t",
+        # The lexer always eats the character after a backslash, even in raw
+        # strings and backtick identifiers ("escaped quotes don't count").
+        r"SELECT r'\' , '; DROP TABLE t; -- '",
+        r"SELECT `a\` , `; DROP TABLE t; -- `",
+        # -- and # comments end at \r as well as \n.
+        "SELECT 1 -- c\r; DROP TABLE t",
+        "SELECT 1 # c\r; DELETE FROM t WHERE TRUE",
+    ],
+)
+def test_validate_read_only_sql_rejects_statement_hidden_behind_a_literal(query: str):
+    # A comment marker inside a literal must not hide the statement after it.
+    with pytest.raises(skill.QueryValidationError):
+        skill.validate_read_only_sql(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT '-- not a comment' AS a",
+        r"SELECT r'C:\path\\' AS p",
+        "SELECT 'a' AS x -- trailing comment with ' quote\nFROM t",
+        "SELECT 1 /* block ' \" ` */ AS x",
+        "SELECT '''multi\nline -- ;''' AS x",
+        "SELECT `my-project.ds.drop` FROM t",
+    ],
+)
+def test_validate_read_only_sql_accepts_literals_and_comments(query: str):
+    assert skill.validate_read_only_sql(query) == query
+
+
+@pytest.mark.parametrize("query", ["SELECT 'unterminated", "SELECT 1 /* open"])
+def test_validate_read_only_sql_rejects_unterminated_tokens(query: str):
+    with pytest.raises(skill.QueryValidationError, match="Unterminated"):
+        skill.validate_read_only_sql(query)
+
+
+def _bq_string_literal(content: str, quote: str) -> str:
+    escaped = (content.replace("\\", "\\\\").replace(quote, "\\" + quote)
+               .replace("\n", "\\n").replace("\r", "\\r"))
+    return f"{quote}{escaped}{quote}"
+
+
+@given(
+    content=st.text(alphabet="ab -/*#;'\"`\\\n", max_size=12),
+    quote=st.sampled_from(["'", '"']),
+)
+@example(content="--", quote="'")
+@example(content="/*", quote='"')
+def test_property_no_literal_hides_a_second_statement(content: str, quote: str):
+    literal = _bq_string_literal(content, quote)
+    single = f"SELECT {literal} AS a"
+    assert skill.validate_read_only_sql(single) == single
+    with pytest.raises(skill.QueryValidationError):
+        skill.validate_read_only_sql(f"{single}; DROP TABLE t")
 
 
 def test_parse_scalar_param_valid_types():
@@ -622,3 +689,91 @@ def test_demo_outputs_do_not_record_the_checkout_path(tmp_path):
     outputs = demo_runner.demo_outputs("bigquery-public", tmp_path)
     leaks = [name for name, text in outputs.items() if str(demo_runner.PROJECT_ROOT) in text]
     assert leaks == []
+
+
+# ---------------------------------------------------------------------------
+# Differential check of the guard's scanner against the BigQuery lexer rules.
+#
+# The reference below transcribes the token patterns of the GoogleSQL lexer
+# grammar (googlesql/parser/googlesql.tm, github.com/google/zetasql) and picks
+# the longest match at each position, as the generated lexer does. It shares
+# no code with bigquery_support._sql_code_view.
+# ---------------------------------------------------------------------------
+import re  # noqa: E402
+
+_ESC = r"(\\(.|\n|\r|\r\n))"
+_SQ = rf"'([^'\\\n\r]|{_ESC})*"
+_DQ = rf'"([^"\\\n\r]|{_ESC})*'
+_SQ3 = rf"'''(('|'')?([^'\\]|{_ESC}))*"
+_DQ3 = rf'"""(("|"")?([^"\\]|{_ESC}))*'
+_BODIES = [f"{_SQ}'", f"{_DQ}\"", _SQ3 + "'''", _DQ3 + "\"\"\""]
+_BODIES0 = [_SQ, _DQ, _SQ3, _DQ3]
+_BQ0 = rf"`([^\\`\r\n]|{_ESC})*"
+# cs_embed_star, with possessive quantifiers: the same language, but Python's
+# backtracking engine would take exponential time on the grammar's form.
+_CS_EMBED = r"([^*]*+(\*++[^/*])*+)*+"
+_REFERENCE_TOKENS = [
+    ("skip", r"[ \n\r\t\x08\f\v]+"),
+    ("skip", rf"/\*{_CS_EMBED}\*+/"),
+    ("skip", r"--[^\r\n]*(\r|\n|\r\n)?"),
+    ("skip", r"#[^\r\n]*(\r|\n|\r\n)?"),
+    *[("skip", rf"(r|b|rb|br)?{body}") for body in _BODIES],
+    ("code", r"[A-Z_][A-Z_0-9]*"),
+    ("skip", rf"{_BQ0}`"),
+    *[("invalid", rf"(r|b|rb|br)?{body}") for body in _BODIES0],
+    ("invalid", _BQ0),
+    ("invalid", rf"/\*{_CS_EMBED}\**"),
+]
+# Python's | takes the first alternative that matches, not the longest, so each
+# string form is its own entry and the longest-match loop chooses between them.
+_REFERENCE_RES = [(kind, re.compile(p, re.IGNORECASE)) for kind, p in _REFERENCE_TOKENS]
+
+
+def _reference_code_tokens(sql: str) -> list[str] | None:
+    """Code tokens (`;` and words) outside literals and comments, or None if the
+    BigQuery lexer would reject the text."""
+    out, i = [], 0
+    while i < len(sql):
+        best_kind, best_end = None, i
+        for kind, rx in _REFERENCE_RES:
+            m = rx.match(sql, i)
+            if m and m.end() > best_end:
+                best_kind, best_end = kind, m.end()
+        if best_kind is None:  # any other single character
+            best_kind, best_end = "code", i + 1
+        if best_kind == "invalid":
+            return None
+        if best_kind == "code":
+            out.append(sql[i:best_end])
+        i = best_end
+    return [t for t in re.findall(r";|[A-Za-z_][A-Za-z_0-9]*", " ".join(out))]
+
+
+def _guard_code_tokens(sql: str) -> list[str] | None:
+    try:
+        view = backends_support._sql_code_view(sql)
+    except skill.QueryValidationError:
+        return None
+    return re.findall(r";|[A-Za-z_][A-Za-z_0-9]*", view)
+
+
+import bigquery_support as backends_support  # noqa: E402
+
+_PREFIXES = {"r", "b", "rb", "br"}
+
+
+@given(st.text(alphabet="ab rR-#/*;'\"`\\\n\r", max_size=24))
+@example("r'\\' , '; DROP TABLE t; -- '")
+@example("`a\\` , `; DROP TABLE t; -- `")
+@example("1 -- c\r; DROP TABLE t")
+@example("'''a''''; DROP TABLE t; -- '")
+def test_property_guard_scanner_agrees_with_the_bigquery_lexer(sql):
+    ref = _reference_code_tokens(sql)
+    got = _guard_code_tokens(sql)
+    assert (ref is None) == (got is None), (ref, got)
+    if ref is not None:
+        # The guard leaves a literal's r/b prefix in place as code; the lexer
+        # folds it into the literal. Neither is a statement or keyword.
+        def norm(tokens):
+            return [t for t in tokens if t.lower() not in _PREFIXES]
+        assert norm(got) == norm(ref)
