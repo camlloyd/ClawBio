@@ -607,6 +607,10 @@ def parse_scoring_file(filepath: str | Path) -> list[dict]:
             weight = float(cols[weight_col].strip())
         except (ValueError, IndexError):
             continue
+        if not math.isfinite(weight):
+            # float() accepts "nan"/"inf"; a NaN weight would make the whole
+            # score NaN, which no percentile threshold can place.
+            continue
 
         variant: dict = {
             "rsid": rsid,
@@ -663,6 +667,10 @@ def compute_allele_dosage(genotype: str, effect_allele: str) -> int:
     return count
 
 
+def _is_single_base(allele: str) -> bool:
+    return len(allele) == 1 and allele.upper() in "ACGT"
+
+
 def calculate_prs(
     genotype_dict: dict[str, str],
     scoring_variants: list[dict],
@@ -687,7 +695,21 @@ def calculate_prs(
         effect_allele = sv["effect_allele"]
         weight = sv["effect_weight"]
 
-        if rsid in genotype_dict:
+        if rsid in genotype_dict and not _is_single_base(effect_allele):
+            # Array genotypes are two single-base calls, so an indel effect
+            # allele (e.g. "AT") can never match. Scoring it as dosage 0 would
+            # count it as used while silently dropping its weight.
+            variants_missing += 1
+            per_variant.append({
+                "rsid": rsid,
+                "effect_allele": effect_allele,
+                "genotype": genotype_dict[rsid],
+                "dosage": None,
+                "weight": weight,
+                "contribution": 0.0,
+                "status": "unscorable",
+            })
+        elif rsid in genotype_dict:
             genotype = genotype_dict[rsid]
             dosage = compute_allele_dosage(genotype, effect_allele)
             contribution = weight * dosage
@@ -745,6 +767,10 @@ def _percentile_from_z(z: float) -> float:
 
 def _assign_risk_category(percentile: float) -> str:
     """Map a percentile (0-100) to a risk category label."""
+    if math.isnan(percentile):
+        # Every comparison with NaN is False, so the loop below would fall
+        # through to "High".
+        raise ValueError("percentile is NaN; cannot assign a risk category")
     for threshold, label in RISK_CATEGORIES:
         if percentile <= threshold:
             return label

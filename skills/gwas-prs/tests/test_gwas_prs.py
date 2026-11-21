@@ -405,3 +405,50 @@ def test_reports_do_not_record_the_input_directory(tmp_path, report):
     text = (out / report).read_text()
     assert str(private_dir) not in text and str(private_dir.resolve()) not in text
     assert patient.name in (out / "prs_report.md").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Non-finite weights, indel effect alleles and NaN percentiles
+# ---------------------------------------------------------------------------
+
+from hypothesis import example, given, strategies as st  # noqa: E402
+
+
+@pytest.mark.parametrize("bad_weight", ["nan", "NaN", "inf", "-inf"])
+def test_parse_scoring_file_drops_non_finite_weights(tmp_path, bad_weight):
+    score_file = tmp_path / "nonfinite.txt"
+    score_file.write_text(
+        "rsID\tchr_name\tchr_position\teffect_allele\tother_allele\teffect_weight\n"
+        "rs100001\t1\t100000\tA\tG\t0.15\n"
+        f"rs100002\t1\t200000\tT\tC\t{bad_weight}\n"
+    )
+    variants = gwas_prs.parse_scoring_file(score_file)
+    assert [v["rsid"] for v in variants] == ["rs100001"]
+
+
+def test_indel_effect_allele_is_unscorable_not_dosage_zero():
+    variants = [
+        {"rsid": "rs1", "effect_allele": "A", "effect_weight": 0.5},
+        {"rsid": "rs2", "effect_allele": "AT", "effect_weight": 2.0},
+    ]
+    prs = gwas_prs.calculate_prs({"rs1": "AG", "rs2": "AG"}, variants)
+    assert prs["variants_used"] == 1
+    assert prs["variants_missing"] == 1
+    assert prs["raw_score"] == pytest.approx(0.5)
+    status = {v["rsid"]: v["status"] for v in prs["per_variant"]}
+    assert status == {"rs1": "scored", "rs2": "unscorable"}
+
+
+def test_nan_percentile_is_not_called_high():
+    with pytest.raises(ValueError, match="NaN"):
+        gwas_prs._assign_risk_category(float("nan"))
+
+
+@given(z1=st.floats(allow_nan=False), z2=st.floats(allow_nan=False))
+@example(z1=float("-inf"), z2=float("inf"))
+def test_property_risk_category_never_drops_as_z_rises(z1, z2):
+    order = ["Low", "Average", "Elevated", "High"]
+    lo, hi = sorted((z1, z2))
+    tier_lo = gwas_prs._assign_risk_category(gwas_prs._percentile_from_z(lo))
+    tier_hi = gwas_prs._assign_risk_category(gwas_prs._percentile_from_z(hi))
+    assert order.index(tier_lo) <= order.index(tier_hi)
