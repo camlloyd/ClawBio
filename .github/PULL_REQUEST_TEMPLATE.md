@@ -11,6 +11,7 @@ Closes #
 ## Checklist
 
 - [ ] I have searched for [existing PRs](https://github.com/ClawBio/ClawBio/pulls)
+- [ ] If this PR fixes an open issue, I commented on that issue to claim it before starting work ([Working on an Issue](https://github.com/ClawBio/ClawBio/blob/main/CONTRIBUTING.md#working-on-an-issue))
 - [ ] I have included a complete SKILL.md (YAML frontmatter + methodology)
 - [ ] I have included tests and they pass (`uv run pytest -v`), with a [property test](https://github.com/ClawBio/ClawBio/blob/main/AGENTS.md#property-based-tests-for-maths-and-parsing) for maths or parsing
 - [ ] I have included demo data for reviewers to test
